@@ -94,6 +94,11 @@ tasks:
     desc: Read a topic (TOPIC=tenant.task-updates.v1 by default)
     vars: {TOPIC: '{{default "tenant.task-updates.v1" .TOPIC}}'}
     cmds: ['docker compose exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka-1:9092 --topic {{.TOPIC}} --from-beginning']
+  kafka:lag:
+    desc: Consumer-group lag and assignments for the workers and control-plane groups
+    cmds:
+      - docker compose exec kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka-1:9092 --describe --group workers
+      - docker compose exec kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka-1:9092 --describe --group control-plane
   scenario:fail:
     desc: Recreate workers with fail rate 1; new tasks will fail
     env: {WORKER_FAIL_RATE: '1'}

@@ -187,6 +187,7 @@ task scenario:fast-publish-off  # sweeper-only publishing (15 s to appear)
 task scenario:fast-publish-on
 task broker:publish -- --task TASK_ID --tenant TENANT_ID --status in_progress
 task broker:tail TOPIC=tenant.task-updates.v1.dlq
+task kafka:lag                   # per-partition consumer lag, both groups
 task db:psql                    # control-plane database
 task tenant:psql                # tenant resource server
 ```

@@ -1,6 +1,8 @@
 # Messaging contract v1
 
 Six partitions per topic, replication factor 2, minimum in-sync replicas 2.
+Retention is explicit per topic: one hour for heartbeats, one week for commands,
+results and their replayable sources, one month for DLQ evidence.
 Commands/results use the tenant UUID as their Kafka key. Heartbeats use worker ID.
 
 | Topic | Types | Consumer group |

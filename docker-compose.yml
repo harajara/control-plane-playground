@@ -134,24 +134,46 @@ services:
       KAFKA_NODE_ID: 2
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
     volumes: [kafka2-data:/var/lib/kafka/data]
+  # A controller-only node listens on 9093 alone, so the broker healthcheck
+  # cannot be inherited; it checks its own Java process instead. It also needs
+  # the inherited restart policy: if this node dies quietly, quorum is 2/3 and
+  # a second failure stalls leader election and metadata changes.
   kafka-controller:
-    image: apache/kafka:3.9.1
+    <<: *kafka
     environment:
       <<: *kafka-env
       KAFKA_NODE_ID: 3
       KAFKA_PROCESS_ROLES: controller
       KAFKA_LISTENERS: CONTROLLER://:9093
     volumes: [kafkac-data:/var/lib/kafka/data]
+    healthcheck:
+      test: [CMD-SHELL, 'grep -qs kafka.Kafka /proc/1/cmdline']
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
   kafka-init:
     image: apache/kafka:3.9.1
     depends_on:
       kafka-1: {condition: service_healthy}
       kafka-2: {condition: service_healthy}
+      kafka-controller: {condition: service_healthy}
     entrypoint: [/bin/bash, -ec]
     command:
       - |
+        # Retention is explicit, never left at the 7-day default. Heartbeats
+        # describe only the last minute, so they expire within the hour;
+        # commands and results keep a week, well beyond any worker's downtime,
+        # so no unconsumed record can age out of retention; DLQ evidence stays
+        # a month for post-mortems. --alter also upgrades pre-existing topics.
         for topic in tenant.tasks.v1 tenant.task-updates.v1 workers.heartbeats.v1 tenant.tasks.v1.dlq tenant.task-updates.v1.dlq workers.heartbeats.v1.dlq; do
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 --create --if-not-exists --topic "$$topic" --partitions 6 --replication-factor 2 --config min.insync.replicas=2
+          case "$$topic" in
+            *.dlq) retention=2592000000 ;;
+            workers.heartbeats.v1) retention=3600000 ;;
+            *) retention=604800000 ;;
+          esac
+          /opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka-1:9092 --alter --entity-type topics --entity-name "$$topic" --add-config retention.ms=$$retention
         done
   bootstrap:
     <<: *control-plane

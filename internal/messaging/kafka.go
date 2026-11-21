@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"strings"
@@ -64,7 +65,7 @@ func (b *Broker) Run(ctx context.Context, handle func(context.Context, Event) er
 			return
 		}
 		if errs := fetches.Errors(); len(errs) > 0 {
-			slog.Warn("broker poll failed; retrying", "count", len(errs))
+			slog.Warn("broker poll failed; retrying", "count", len(errs), "error_type", fmt.Sprintf("%T", errs[0].Err))
 			b.Client.AllowRebalance()
 			if !Backoff(ctx, 2) {
 				return
@@ -88,7 +89,7 @@ func (b *Broker) Run(ctx context.Context, handle func(context.Context, Event) er
 				if err == nil {
 					break
 				}
-				slog.Warn("message processing will retry", "topic", r.Topic, "attempt", attempt)
+				slog.Warn("message processing will retry", "topic", r.Topic, "attempt", attempt, "error_type", fmt.Sprintf("%T", err))
 				if !Backoff(ctx, attempt) {
 					break
 				}
