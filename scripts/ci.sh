@@ -4,7 +4,8 @@
 set -euo pipefail
 cd /src
 
-# Only warn about the container's own module-cache permissions.
+# The container may run as a different user than the checkout owner; allow the
+# module cache to be used without demanding an exact go.mod match.
 export GOFLAGS=-mod=mod
 
 case "${1:?usage: ci.sh fmt|vet|unit|integration|bdd|vuln|all}" in

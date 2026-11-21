@@ -15,3 +15,6 @@ cookies.txt
 *.swp
 .DS_Store
 Thumbs.db
+
+# Scratch output from local debugging runs
+.tmp/
