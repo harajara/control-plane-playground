@@ -43,7 +43,7 @@ the real infrastructure work:
 flowchart LR
   Client[curl / API client / godog] --> CP[2 active Go control planes]
   CP --> DB[(Control-plane Postgres)]
-  CP --> Kafka[Kafka: 2 brokers + third controller]
+  CP --> Kafka[Kafka: 3 brokers + dedicated controller]
   Kafka --> Worker[3 Go workers]
   Worker --> Kafka
   Worker --> PG[(Separate tenant Postgres)]
@@ -225,11 +225,16 @@ row.
 ## Consistency and availability trade-offs
 
 
-* Kafka has a leader **per partition**, not a cluster master. RF=2 with
-  min ISR=2 means both brokers must acknowledge; losing one pauses new
-  publications while task acceptance continues (Postgres is enough for that).
-  A third controller-only process keeps controller quorum with one broker down
-  but adds no data replica.
+* Kafka has a leader **per partition**, not a cluster master. RF=3 with
+  min ISR=2 means two of three brokers must acknowledge; losing one broker
+  no longer pauses publications, and only a two-broker outage does, while task
+  acceptance continues regardless (Postgres is enough for that). A fourth,
+  controller-only process makes the metadata quorum 4 voters without adding a
+  data replica.
+* A persistently failing record is retried twelve times in place, then parked
+  to its partition tail (up to twenty rounds, counted in a `cp-attempts`
+  header) so no single message can hold a partition hostage, and only then
+  dead-lettered as `retry_exhausted`. See `docs/events.md`.
 * Both Postgres servers are single-node local dependencies; two API replicas do
   not make the database highly available.
 * One shared HMAC key is the requested machine-to-machine model. Any worker can

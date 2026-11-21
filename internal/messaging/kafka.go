@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,6 +59,39 @@ func Backoff(ctx context.Context, attempt int) bool {
 		return true
 	}
 }
+
+// A record that keeps failing is retried in place with capped backoff for
+// inPlaceRetries attempts (~2.5 minutes), then parked: the exact bytes go to
+// the tail of the same partition, tagged with an attempt count, and the
+// original offset commits so the partition moves again. A parked record that
+// still fails after maxParks rounds is dead-lettered with code
+// retry_exhausted. Parking is safe because the state machine never queues a
+// second command for a tenant behind an unprocessed one, and the control
+// plane buffers or dedupes results by task id, so log order cannot corrupt
+// state - only delay it.
+const (
+	inPlaceRetries = 12
+	maxParks       = 20
+	attemptsKey    = "cp-attempts"
+)
+
+func parkCount(r *kgo.Record) int {
+	for _, h := range r.Headers {
+		if h.Key == attemptsKey {
+			n, _ := strconv.Atoi(string(h.Value))
+			return n
+		}
+	}
+	return 0
+}
+
+// dlq preserves the original ciphertext as evidence and never copies it into
+// logs. A failed DLQ write returns an error, so the offset cannot advance.
+func (b *Broker) dlq(ctx context.Context, r *kgo.Record, code string) error {
+	d, _ := json.Marshal(map[string]any{"topic": r.Topic, "partition": r.Partition, "offset": r.Offset, "value": r.Value, "code": code})
+	return b.Client.ProduceSync(ctx, &kgo.Record{Topic: r.Topic + ".dlq", Key: r.Key, Value: d}).FirstErr()
+}
+
 func (b *Broker) Run(ctx context.Context, handle func(context.Context, Event) error) {
 	for ctx.Err() == nil {
 		fetches := b.Client.PollRecords(ctx, 1)
@@ -78,10 +112,19 @@ func (b *Broker) Run(ctx context.Context, handle func(context.Context, Event) er
 				if err == nil {
 					err = handle(ctx, e)
 				}
-				if errors.Is(err, ErrPoison) {
-					// Original ciphertext is retained, never copied into logs or the UI.
-					d, _ := json.Marshal(map[string]any{"topic": r.Topic, "partition": r.Partition, "offset": r.Offset, "value": r.Value, "code": "invalid_event"})
-					err = b.Client.ProduceSync(ctx, &kgo.Record{Topic: r.Topic + ".dlq", Key: r.Key, Value: d}).FirstErr()
+				switch {
+				case errors.Is(err, ErrPoison):
+					err = b.dlq(ctx, r, "invalid_event")
+				case err != nil && attempt >= inPlaceRetries:
+					if n := parkCount(r); n >= maxParks {
+						err = b.dlq(ctx, r, "retry_exhausted")
+					} else if perr := b.Client.ProduceSync(ctx, &kgo.Record{
+						Topic: r.Topic, Key: r.Key, Value: r.Value,
+						Headers: []kgo.RecordHeader{{Key: attemptsKey, Value: []byte(strconv.Itoa(n + 1))}},
+					}).FirstErr(); perr == nil {
+						slog.Warn("message parked at partition tail", "topic", r.Topic, "attempts", n+1)
+						err = nil
+					}
 				}
 				if err == nil {
 					err = b.Client.CommitRecords(ctx, r)

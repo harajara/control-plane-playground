@@ -1,6 +1,6 @@
 # Messaging contract v1
 
-Six partitions per topic, replication factor 2, minimum in-sync replicas 2.
+Six partitions per topic, replication factor 3, minimum in-sync replicas 2.
 Retention is explicit per topic: one hour for heartbeats, one week for commands,
 results and their replayable sources, one month for DLQ evidence.
 Commands/results use the tenant UUID as their Kafka key. Heartbeats use worker ID.
@@ -13,9 +13,13 @@ Commands/results use the tenant UUID as their Kafka key. Heartbeats use worker I
 
 Each topic has a corresponding `.dlq`. Malformed, unsupported, or incorrectly
 signed records are copied there with source topic, partition, offset, original
-bytes, and a stable error code. A transient database or broker outage is retried,
-not dead-lettered. Offsets advance only after successful durable processing or a
-confirmed DLQ write.
+bytes, and a stable error code. A transient database or broker outage is retried
+with backoff, never dead-lettered early: after twelve in-place attempts the
+record is re-enqueued at the tail of its own partition with a `cp-attempts`
+header (parking is safe because the tenant state machine never queues a second
+command behind an unprocessed one, and results dedupe by task id), and only
+after twenty such rounds it is dead-lettered with `retry_exhausted`. Offsets
+advance only after successful durable processing or a confirmed DLQ write.
 
 ```json
 {

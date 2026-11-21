@@ -87,7 +87,7 @@ func raw(ctx context.Context, value []byte, topic, key string) error {
 func seedBrokers() []string {
 	v := os.Getenv("KAFKA_BROKERS")
 	if v == "" {
-		return []string{"kafka-1:9092", "kafka-2:9092"}
+		return []string{"kafka-1:9092", "kafka-2:9092", "kafka-3:9092"}
 	}
 	return strings.Split(v, ",")
 }

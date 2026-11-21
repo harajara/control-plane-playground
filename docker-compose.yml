@@ -18,15 +18,15 @@ x-control-plane-keys: &cp-keys
 x-kafka-env: &kafka-env
   CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
   KAFKA_PROCESS_ROLES: broker,controller
-  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-controller:9093
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-controller:9093,4@kafka-3:9093
   KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
   KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
   KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
   KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-  KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
   KAFKA_MIN_INSYNC_REPLICAS: 2
-  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
-  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
   KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
   KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: 'false'
   KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
@@ -52,7 +52,7 @@ x-worker: &worker
   volumes: [secrets-data:/data/secrets]
   environment: &worker-env
     <<: *keys
-    KAFKA_BROKERS: kafka-1:9092,kafka-2:9092
+    KAFKA_BROKERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
     SECRET_STORE_DIR: /data/secrets
     # Tenant resource server administrator credentials are worker environment
     # only; they are never stored in the control-plane database.
@@ -80,7 +80,7 @@ x-control-plane: &control-plane
   environment: &control-plane-env
     <<: *cp-keys
     DATABASE_URL: postgres://postgres:${CP_DB_PASSWORD}@control-plane-db:5432/controlplane?sslmode=disable
-    KAFKA_BROKERS: kafka-1:9092,kafka-2:9092
+    KAFKA_BROKERS: kafka-1:9092,kafka-2:9092,kafka-3:9092
     ADMIN_EMAIL: ${ADMIN_EMAIL}
     ADMIN_PASSWORD: ${ADMIN_PASSWORD}
     # CP_FAST_PUBLISH=false disables only the in-request publish; the sweeper
@@ -134,6 +134,15 @@ services:
       KAFKA_NODE_ID: 2
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
     volumes: [kafka2-data:/var/lib/kafka/data]
+  # The third broker is what makes RF=3 possible: with min ISR=2 the cluster
+  # keeps publishing through the loss of any single broker.
+  kafka-3:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 4
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-3:9092
+    volumes: [kafka3-data:/var/lib/kafka/data]
   # A controller-only node listens on 9093 alone, so the broker healthcheck
   # cannot be inherited; it checks its own Java process instead. It also needs
   # the inherited restart policy: if this node dies quietly, quorum is 2/3 and
@@ -157,6 +166,7 @@ services:
     depends_on:
       kafka-1: {condition: service_healthy}
       kafka-2: {condition: service_healthy}
+      kafka-3: {condition: service_healthy}
       kafka-controller: {condition: service_healthy}
     entrypoint: [/bin/bash, -ec]
     command:
@@ -165,9 +175,10 @@ services:
         # describe only the last minute, so they expire within the hour;
         # commands and results keep a week, well beyond any worker's downtime,
         # so no unconsumed record can age out of retention; DLQ evidence stays
-        # a month for post-mortems. --alter also upgrades pre-existing topics.
+        # a month for post-mortems. --add-config also reaches topics that
+        # predate this file.
         for topic in tenant.tasks.v1 tenant.task-updates.v1 workers.heartbeats.v1 tenant.tasks.v1.dlq tenant.task-updates.v1.dlq workers.heartbeats.v1.dlq; do
-          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 --create --if-not-exists --topic "$$topic" --partitions 6 --replication-factor 2 --config min.insync.replicas=2
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 --create --if-not-exists --topic "$$topic" --partitions 6 --replication-factor 3 --config min.insync.replicas=2
           case "$$topic" in
             *.dlq) retention=2592000000 ;;
             workers.heartbeats.v1) retention=3600000 ;;
@@ -175,6 +186,32 @@ services:
           esac
           /opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka-1:9092 --alter --entity-type topics --entity-name "$$topic" --add-config retention.ms=$$retention
         done
+        # Topics that already existed at RF=2 (including the offsets topic)
+        # must be re-assigned, not re-created: neither kafka-topics nor
+        # kafka-reassign-partitions can alter a replication factor in place.
+        # The target plan is therefore written out: every partition of every
+        # topic gets all three data brokers (IDs 1, 2, and 4), rotated so
+        # leadership spreads evenly. Re-running it on a healthy RF=3 cluster
+        # is a no-op.
+        read -r b1 b2 b3 <<< '1 2 4'
+        plan='{"version":1,"partitions":['
+        sep=''
+        for spec in tenant.tasks.v1:6 tenant.task-updates.v1:6 workers.heartbeats.v1:6 tenant.tasks.v1.dlq:6 tenant.task-updates.v1.dlq:6 workers.heartbeats.v1.dlq:6 __consumer_offsets:50; do
+          topic=$${spec%%:*}
+          count=$${spec##*:}
+          for ((p = 0; p < count; p++)); do
+            case $$((p % 3)) in
+              0) replicas="$$b1,$$b2,$$b3" ;;
+              1) replicas="$$b2,$$b3,$$b1" ;;
+              *) replicas="$$b3,$$b1,$$b2" ;;
+            esac
+            plan+="$${sep}{\"topic\":\"$$topic\",\"partition\":$$p,\"replicas\":[$$replicas]}"
+            sep=','
+          done
+        done
+        plan+=']}'
+        printf '%s' "$$plan" > /tmp/plan.json
+        /opt/kafka/bin/kafka-reassign-partitions.sh --bootstrap-server kafka-1:9092 --reassignment-json-file /tmp/plan.json --execute
   bootstrap:
     <<: *control-plane
     command: [bootstrap]
@@ -251,6 +288,7 @@ volumes:
   tenant-data:
   kafka1-data:
   kafka2-data:
+  kafka3-data:
   kafkac-data:
   secrets-data:
   # Build caches. `task reset` removes them along with the data volumes; the
