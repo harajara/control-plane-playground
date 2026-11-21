@@ -1,0 +1,285 @@
+openapi: 3.0.3
+info:
+  title: Tenant Provisioning Control Plane
+  version: 1.0.0
+  description: Asynchronous provisioning. Every authenticated user is an administrator. Infrastructure values exist only in the tenant secret.
+servers:
+  - url: /
+security:
+  - session: []
+  - bearer: []
+paths:
+  /v1/tenants:
+    get:
+      operationId: listTenants
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
+        - name: status
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: Tenants in ascending creation order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/Tenant'}}
+                  next_cursor: {type: string}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      operationId: createTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [slug, name]
+              properties:
+                slug: {type: string, pattern: '^[a-z][-a-z0-9]{1,26}[a-z0-9]$'}
+                name: {type: string, minLength: 1, maxLength: 200}
+      responses:
+        '202': {$ref: '#/components/responses/Mutation'}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/tenants/{tenantId}:
+    parameters:
+      - name: tenantId
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      operationId: getTenant
+      responses:
+        '200':
+          description: Tenant metadata and its infrastructure secret ID
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Tenant'}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      operationId: updateTenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [version]
+              properties:
+                version: {type: integer, format: int64, minimum: 1}
+                name: {type: string, minLength: 1, maxLength: 200}
+                database_url: {type: string, maxLength: 8192, writeOnly: true, description: Encrypted immediately; never returned or logged. PostgreSQL URL.}
+      responses:
+        '202': {$ref: '#/components/responses/Mutation'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      operationId: deleteTenant
+      responses:
+        '202': {$ref: '#/components/responses/Mutation'}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/tasks:
+    get:
+      operationId: listTasks
+      parameters:
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cursor'
+        - {name: tenant_id, in: query, schema: {type: string, format: uuid}}
+        - {name: status, in: query, schema: {type: string}}
+        - {name: type, in: query, schema: {type: string, enum: [deploy, update, destroy]}}
+      responses:
+        '200':
+          description: Tasks in ascending creation order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/Task'}}
+                  next_cursor: {type: string}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/tasks/{taskId}:
+    get:
+      operationId: getTask
+      parameters:
+        - {name: taskId, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        '200':
+          description: Task
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Task'}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/auth/login:
+    post:
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              additionalProperties: false
+              properties:
+                email: {type: string}
+                password: {type: string, format: password}
+      responses:
+        '200': {$ref: '#/components/responses/User'}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/auth/logout:
+    post:
+      operationId: logout
+      responses:
+        '204': {description: Session revoked}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/auth/me:
+    get:
+      operationId: me
+      responses:
+        '200': {$ref: '#/components/responses/User'}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/users:
+    get:
+      operationId: listUsers
+      responses:
+        '200':
+          description: Administrators
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/User'}}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              additionalProperties: false
+              properties:
+                email: {type: string}
+                password: {type: string, format: password, minLength: 12, maxLength: 1024}
+      responses:
+        '201': {$ref: '#/components/responses/User'}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/api-tokens:
+    get:
+      operationId: listTokens
+      responses:
+        '200':
+          description: Current user's tokens
+          content:
+            application/json:
+              schema: {type: array, items: {type: object, required: [id, name], properties: {id: {type: string}, name: {type: string}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      operationId: createToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [name], properties: {name: {type: string, minLength: 1, maxLength: 100}}}
+      responses:
+        '201':
+          description: Token shown once
+          content:
+            application/json:
+              schema: {type: object, required: [token], properties: {token: {type: string}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/api-tokens/{tokenId}:
+    delete:
+      operationId: deleteToken
+      parameters:
+        - {name: tokenId, in: path, required: true, schema: {type: string}}
+      responses:
+        '204': {description: Revoked}
+        default: {$ref: '#/components/responses/Problem'}
+  /v1/workers:
+    get:
+      operationId: listWorkers
+      responses:
+        '200':
+          description: Workers; online means heartbeat within 15 seconds
+          content:
+            application/json:
+              schema: {type: array, items: {type: object, required: [id, last_seen, online], properties: {id: {type: string}, last_seen: {type: string, format: date-time}, online: {type: boolean}, current_task: {type: string}}}}
+        default: {$ref: '#/components/responses/Problem'}
+components:
+  securitySchemes:
+    session: {type: apiKey, in: cookie, name: cp_session}
+    bearer: {type: http, scheme: bearer}
+  parameters:
+    limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 20}}
+    cursor: {name: cursor, in: query, schema: {type: string}}
+  responses:
+    Problem:
+      description: RFC 9457 problem
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    User:
+      description: Administrator
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/User'}
+    Mutation:
+      description: Tenant mutation committed, task accepted
+      headers:
+        Location: {schema: {type: string}, description: Tenant resource URI}
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [tenant, task]
+            properties:
+              tenant: {$ref: '#/components/schemas/Tenant'}
+              task: {$ref: '#/components/schemas/Task'}
+  schemas:
+    User:
+      type: object
+      required: [id, email]
+      properties:
+        id: {type: string, format: uuid}
+        email: {type: string}
+    Problem:
+      type: object
+      required: [type, title, status, code, detail, instance]
+      properties:
+        type: {type: string, format: uri-reference}
+        title: {type: string}
+        status: {type: integer}
+        code: {type: string}
+        detail: {type: string}
+        instance: {type: string}
+    Tenant:
+      type: object
+      required: [id, slug, name, status, version, infra_secret_id, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        slug: {type: string}
+        name: {type: string}
+        status: {type: string, enum: [provisioning, active, updating, failed, destroying, destroyed]}
+        version: {type: integer, format: int64}
+        infra_secret_id: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    Task:
+      type: object
+      required: [id, type, tenant_id, status, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        type: {type: string, enum: [deploy, update, destroy]}
+        tenant_id: {type: string, format: uuid}
+        status: {type: string, enum: [accepted, in_progress, done, failed]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}

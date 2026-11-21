@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+[allowlist]
+description = "Local runtime artifacts (never committed)"
+paths = [
+  '''(^|/)\.env$''',
+  '''(^|/)\.git/'''
+]

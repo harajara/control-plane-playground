@@ -1,0 +1,142 @@
+version: '3'
+
+vars:
+  GO_IMAGE: golang:1.27.4-bookworm
+
+tasks:
+  setup:
+    desc: Generate local keys and passwords into .env (existing values are preserved)
+    cmds:
+      - docker run --rm -v "{{.ROOT_DIR}}:/src" -w /src {{.GO_IMAGE}} go run ./cmd/setup
+  up:
+    desc: Build and boot two control planes, three workers, Postgres and Kafka
+    cmds:
+      - task: setup
+      - docker compose up -d --build --wait --wait-timeout 240 --remove-orphans
+  down:
+    desc: Stop the application, preserving persistent volumes
+    cmds: [docker compose down --remove-orphans]
+  logs:
+    desc: Follow application logs
+    cmds: [docker compose logs -f --tail 100 control-plane-1 control-plane-2 worker-1 worker-2 worker-3]
+  ps:
+    desc: Show stack health
+    cmds: [docker compose ps --all]
+  build:
+    desc: Build the application image
+    cmds: [docker compose build control-plane-1]
+  reset:
+    desc: Delete every volume and .env, then boot again (destructive)
+    cmds:
+      - docker compose down -v --remove-orphans
+      - docker run --rm -v "{{.ROOT_DIR}}:/src" -w /src alpine:3.20 rm -f /src/.env
+      - task: up
+  generate:
+    desc: Regenerate the Go server and models from OpenAPI
+    cmds:
+      - docker compose run --rm --no-deps test go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.4.1 --config api/oapi-codegen.yaml api/openapi.yaml
+  fmt:
+    desc: Format Go code
+    cmds:
+      - docker compose run --rm --no-deps test gofmt -w cmd internal tests scripts
+  fmt:check:
+    desc: Fail when Go code is not formatted
+    cmds:
+      - docker compose run --rm --no-deps test bash /src/scripts/ci.sh fmt
+  lint:
+    desc: Static analysis
+    cmds:
+      - docker compose run --rm --no-deps test bash /src/scripts/ci.sh vet
+  test:unit:
+    desc: Unit tests with race detection
+    cmds:
+      - docker compose run --rm --no-deps test bash /src/scripts/ci.sh unit
+  test:integration:
+    desc: Integration tests against real Postgres and Kafka
+    cmds:
+      - docker compose run --rm --no-deps test bash /src/scripts/ci.sh integration
+  test:bdd:
+    desc: Gherkin scenarios (godog) against the booted stack
+    cmds:
+      - docker compose run --rm --no-deps test bash /src/scripts/ci.sh bdd
+  bdd:stubs:
+    desc: Regenerate godog step stubs from features/*.feature
+    cmds:
+      - docker compose run --rm --no-deps test go run ./tests/bdd/generate
+  logs:check:
+    desc: Assert one lifecycle run produces only meaningful, sanitized log lines
+    cmds:
+      - docker compose run --rm --no-deps test go run ./cmd/logcheck
+  test:
+    desc: Boot the stack and run the complete automated suite
+    cmds:
+      - task: up
+      - task: test:unit
+      - task: test:integration
+      - task: test:bdd
+      - task: logs:check
+  sec:
+    desc: Scan source for secrets and check dependency vulnerabilities
+    cmds:
+      - docker run --rm -v "{{.ROOT_DIR}}:/repo" zricethezav/gitleaks:v8.24.2 dir /repo --config /repo/.gitleaks.toml --redact
+      - docker compose run --rm --no-deps test bash /src/scripts/ci.sh vuln
+  check:
+    desc: Full quality gate (boot, formatting, static analysis, security, all tests)
+    cmds:
+      - task: test
+      - task: fmt:check
+      - task: lint
+      - task: sec
+  broker:publish:
+    desc: Publish signed scenario results (-- --task ID --tenant ID --status done --repeat 2)
+    cmds: ['docker compose run --rm --no-deps test go run ./cmd/cpctl {{.CLI_ARGS}}']
+  broker:tail:
+    desc: Read a topic (TOPIC=tenant.task-updates.v1 by default)
+    vars: {TOPIC: '{{default "tenant.task-updates.v1" .TOPIC}}'}
+    cmds: ['docker compose exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka-1:9092 --topic {{.TOPIC}} --from-beginning']
+  scenario:fail:
+    desc: Recreate workers with fail rate 1; new tasks will fail
+    env: {WORKER_FAIL_RATE: '1'}
+    cmds: [docker compose up -d --no-deps --force-recreate worker-1 worker-2 worker-3]
+  scenario:slow:
+    desc: Recreate workers with 20-30 second processing delays
+    env: {WORKER_MIN_DELAY_MS: '20000', WORKER_MAX_DELAY_MS: '30000'}
+    cmds: [docker compose up -d --no-deps --force-recreate worker-1 worker-2 worker-3]
+  scenario:reset:
+    desc: Restore normal worker settings
+    env: {WORKER_FAIL_RATE: '0', WORKER_MIN_DELAY_MS: '500', WORKER_MAX_DELAY_MS: '2000'}
+    cmds: [docker compose up -d --no-deps --force-recreate worker-1 worker-2 worker-3]
+  scenario:fast-publish-off:
+    desc: Restart both control planes with only the sweeper publishing
+    env: {CP_FAST_PUBLISH: 'false'}
+    cmds: [docker compose up -d --no-deps --force-recreate control-plane-1 control-plane-2]
+  scenario:fast-publish-on:
+    desc: Restore the in-request publish path
+    env: {CP_FAST_PUBLISH: 'true'}
+    cmds: [docker compose up -d --no-deps --force-recreate control-plane-1 control-plane-2]
+  scenario:poison:
+    desc: Publish undecodable bytes; the consumer must dead-letter them and continue
+    cmds: [docker compose run --rm --no-deps test go run ./cmd/cpctl --poison]
+  scenario:unsigned:
+    desc: Publish an unsigned result (TASK and TENANT required); it must dead-letter
+    requires: {vars: [TASK, TENANT]}
+    cmds: ['docker compose run --rm --no-deps test go run ./cmd/cpctl --task {{.TASK}} --tenant {{.TENANT}} --status done --unsigned']
+  scenario:duplicate:
+    desc: Duplicate a terminal update (TASK and TENANT required)
+    requires: {vars: [TASK, TENANT]}
+    cmds: ['docker compose run --rm --no-deps test go run ./cmd/cpctl --task {{.TASK}} --tenant {{.TENANT}} --status done --repeat 2']
+  scenario:out-of-order:
+    desc: Send done before in_progress for a deploy (stop workers first for a deterministic demo)
+    requires: {vars: [TASK, TENANT]}
+    cmds:
+      - 'docker compose run --rm --no-deps test go run ./cmd/cpctl --task {{.TASK}} --tenant {{.TENANT}} --status done'
+      - 'docker compose run --rm --no-deps test go run ./cmd/cpctl --task {{.TASK}} --tenant {{.TENANT}} --status in_progress'
+  db:psql:
+    desc: Open a control-plane database console
+    cmds: [docker compose exec control-plane-db psql -U postgres -d controlplane]
+  tenant:psql:
+    desc: Open the tenant resource server console
+    cmds: [docker compose exec tenant-db psql -U postgres]
+  deps:cache-windows:
+    desc: Optional official-proxy cache helper for restricted Windows Go networking
+    cmds: [pwsh -File scripts/cache-modules.ps1]

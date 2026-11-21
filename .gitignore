@@ -1,0 +1,17 @@
+# Local secrets and environment
+.env
+secrets/
+
+# Build output
+bin/
+dist/
+coverage.out
+cookies.txt
+*.log
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

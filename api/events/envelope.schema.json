@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://control-plane.local/schemas/envelope-v1.json",
+  "title": "Control-plane event envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "type", "source", "time", "data", "token"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "format": "uuid"},
+    "type": {"enum": ["task.deploy", "task.update", "task.destroy", "task.in_progress", "task.done", "task.failed", "worker.heartbeat"]},
+    "source": {"type": "string", "minLength": 1},
+    "time": {"type": "string", "format": "date-time"},
+    "tenant_id": {"type": "string", "format": "uuid"},
+    "data": {"type": "object"},
+    "token": {"type": "string", "minLength": 1}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"type": {"enum": ["task.deploy", "task.update", "task.destroy"]}}},
+      "then": {
+        "required": ["tenant_id"],
+        "properties": {
+          "data": {
+            "required": ["task", "slug", "infra_secret_id"],
+            "properties": {
+              "task": {"type": "object", "required": ["id", "type", "tenant_id", "status", "created_at", "updated_at"], "properties": {"id": {"type": "string", "format": "uuid"}, "type": {"enum": ["deploy", "update", "destroy"]}, "tenant_id": {"type": "string", "format": "uuid"}, "status": {"const": "accepted"}, "created_at": {"type": "string", "format": "date-time"}, "updated_at": {"type": "string", "format": "date-time"}}},
+              "slug": {"type": "string", "pattern": "^[a-z][-a-z0-9]{1,26}[a-z0-9]$"},
+              "infra_secret_id": {"type": "string"},
+              "pending_name": {"type": "string"},
+              "sealed_database_url": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"type": {"enum": ["task.in_progress", "task.done", "task.failed"]}}},
+      "then": {
+        "required": ["tenant_id"],
+        "properties": {"data": {"required": ["task_id", "tenant_id", "type", "status"], "properties": {"task_id": {"type": "string", "format": "uuid"}, "tenant_id": {"type": "string", "format": "uuid"}, "type": {"enum": ["deploy", "update", "destroy"]}, "status": {"enum": ["in_progress", "done", "failed"]}, "error_code": {"type": "string"}}}}
+      }
+    },
+    {
+      "if": {"properties": {"type": {"const": "worker.heartbeat"}}},
+      "then": {"properties": {"data": {"required": ["id", "last_seen", "online"], "properties": {"id": {"type": "string"}, "last_seen": {"type": "string", "format": "date-time"}, "online": {"type": "boolean"}, "current_task": {"type": "string"}}}}}
+    }
+  ]
+}

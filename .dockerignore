@@ -1,0 +1,12 @@
+.git
+.env
+secrets
+bin
+coverage*
+*.out
+features
+docs
+spec
+tests
+Taskfile.yml
+docker-compose.yml

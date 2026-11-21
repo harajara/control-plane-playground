@@ -1,0 +1,237 @@
+name: tenant-control-plane
+
+# Every secret is environment configuration from .env (created by task setup).
+# There is no LocalStack, no KMS and no Secrets Manager: message signing uses
+# M2M_SECRET, imported connection strings are sealed to WORKER_SEAL_KEY, and
+# tenant infrastructure documents live on the secrets-data volume.
+x-keys: &keys
+  M2M_SECRET: ${M2M_SECRET:?Run task setup}
+  WORKER_SEAL_KEY: ${WORKER_SEAL_KEY:?Run task setup}
+  CONTROL_PLANE_RECEIVE_KEY: ${CONTROL_PLANE_RECEIVE_KEY:?Run task setup}
+
+# The control plane signs and seals; it cannot open a sealed URL because it
+# never receives the worker's private key. Only workers hold all three keys.
+x-control-plane-keys: &cp-keys
+  M2M_SECRET: ${M2M_SECRET:?Run task setup}
+  CONTROL_PLANE_RECEIVE_KEY: ${CONTROL_PLANE_RECEIVE_KEY:?Run task setup}
+
+x-kafka-env: &kafka-env
+  CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9093,3@kafka-controller:9093
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+  KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE: 'false'
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  KAFKA_HEAP_OPTS: -Xmx384m -Xms256m
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 500
+
+x-kafka: &kafka
+  image: apache/kafka:3.9.1
+  restart: unless-stopped
+  healthcheck:
+    test: [CMD-SHELL, '/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1']
+    interval: 10s
+    timeout: 10s
+    retries: 18
+    start_period: 30s
+
+x-worker: &worker
+  image: tenant-control-plane:local
+  build: .
+  command: [worker]
+  restart: unless-stopped
+  volumes: [secrets-data:/data/secrets]
+  environment: &worker-env
+    <<: *keys
+    KAFKA_BROKERS: kafka-1:9092,kafka-2:9092
+    SECRET_STORE_DIR: /data/secrets
+    # Tenant resource server administrator credentials are worker environment
+    # only; they are never stored in the control-plane database.
+    TENANT_DB_ADMIN_URL: postgres://postgres:${TENANT_DB_PASSWORD}@tenant-db:5432/postgres?sslmode=disable
+    WORKER_FAIL_RATE: ${WORKER_FAIL_RATE:-0}
+    WORKER_MIN_DELAY_MS: ${WORKER_MIN_DELAY_MS:-500}
+    WORKER_MAX_DELAY_MS: ${WORKER_MAX_DELAY_MS:-2000}
+    CP_LOG_LEVEL: ${CP_LOG_LEVEL:-info}
+  depends_on:
+    bootstrap: {condition: service_completed_successfully}
+    kafka-init: {condition: service_completed_successfully}
+    tenant-db: {condition: service_healthy}
+  healthcheck:
+    test: [CMD-SHELL, 'test -n "$$(find /tmp/worker-heartbeat -mmin -1 2>/dev/null)"']
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 30s
+
+x-control-plane: &control-plane
+  image: tenant-control-plane:local
+  build: .
+  command: [control-plane]
+  restart: unless-stopped
+  environment: &control-plane-env
+    <<: *cp-keys
+    DATABASE_URL: postgres://postgres:${CP_DB_PASSWORD}@control-plane-db:5432/controlplane?sslmode=disable
+    KAFKA_BROKERS: kafka-1:9092,kafka-2:9092
+    ADMIN_EMAIL: ${ADMIN_EMAIL}
+    ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+    # CP_FAST_PUBLISH=false disables only the in-request publish; the sweeper
+    # then republishes tasks older than five seconds.
+    CP_FAST_PUBLISH: ${CP_FAST_PUBLISH:-true}
+    COOKIE_SECURE: ${COOKIE_SECURE:-false}
+    CP_LOG_LEVEL: ${CP_LOG_LEVEL:-info}
+  depends_on:
+    control-plane-db: {condition: service_healthy}
+    bootstrap: {condition: service_completed_successfully}
+    kafka-init: {condition: service_completed_successfully}
+  healthcheck:
+    test: [CMD, curl, -fsS, 'http://localhost:8080/readyz']
+    interval: 5s
+    timeout: 3s
+    retries: 30
+
+services:
+  control-plane-db:
+    image: postgres:17.7-alpine
+    environment:
+      POSTGRES_PASSWORD: ${CP_DB_PASSWORD:?Run task setup}
+      POSTGRES_DB: controlplane
+    volumes: [cp-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U postgres -d controlplane']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  tenant-db:
+    image: postgres:17.7-alpine
+    environment:
+      POSTGRES_PASSWORD: ${TENANT_DB_PASSWORD:?Run task setup}
+    volumes: [tenant-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U postgres']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  kafka-1:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-1:9092
+    volumes: [kafka1-data:/var/lib/kafka/data]
+  kafka-2:
+    <<: *kafka
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-2:9092
+    volumes: [kafka2-data:/var/lib/kafka/data]
+  kafka-controller:
+    image: apache/kafka:3.9.1
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: controller
+      KAFKA_LISTENERS: CONTROLLER://:9093
+    volumes: [kafkac-data:/var/lib/kafka/data]
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka-1: {condition: service_healthy}
+      kafka-2: {condition: service_healthy}
+    entrypoint: [/bin/bash, -ec]
+    command:
+      - |
+        for topic in tenant.tasks.v1 tenant.task-updates.v1 workers.heartbeats.v1 tenant.tasks.v1.dlq tenant.task-updates.v1.dlq workers.heartbeats.v1.dlq; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka-1:9092 --create --if-not-exists --topic "$$topic" --partitions 6 --replication-factor 2 --config min.insync.replicas=2
+        done
+  bootstrap:
+    <<: *control-plane
+    command: [bootstrap]
+    restart: 'no'
+    volumes: [secrets-data:/data/secrets]
+    healthcheck: {disable: true}
+    environment:
+      <<: *keys
+      # Bootstrap validates the same key material the services will use, the
+      # tenant resource server, and the secret store root.
+      TENANT_DB_ADMIN_URL: postgres://postgres:${TENANT_DB_PASSWORD}@tenant-db:5432/postgres?sslmode=disable
+      SECRET_STORE_DIR: /data/secrets
+    depends_on:
+      tenant-db: {condition: service_healthy}
+  # Two active API replicas. Only replica 1 is published to the host loopback;
+  # replica 2 is reachable on the compose network (or docker compose exec).
+  control-plane-1:
+    <<: *control-plane
+    container_name: control-plane-1
+    hostname: control-plane-1
+    ports: ['127.0.0.1:8080:8080']
+    labels: {cp.role: control-plane}
+  control-plane-2:
+    <<: *control-plane
+    container_name: control-plane-2
+    hostname: control-plane-2
+    labels: {cp.role: control-plane}
+  # Three provisioning workers. Six task partitions bound the useful worker
+  # count. Hostnames are pinned so a recreated container keeps its identity
+  # instead of becoming a new row in the workers table.
+  worker-1:
+    <<: *worker
+    container_name: worker-1
+    hostname: worker-1
+    labels: {cp.role: worker}
+  worker-2:
+    <<: *worker
+    container_name: worker-2
+    hostname: worker-2
+    labels: {cp.role: worker}
+  worker-3:
+    <<: *worker
+    container_name: worker-3
+    hostname: worker-3
+    labels: {cp.role: worker}
+  # Scenario tooling: signed cpctl publishes, log inspection, and the Gherkin
+  # suite. The Docker socket is mounted so scenarios can stop and resume
+  # workers or restart the control planes for real.
+  test:
+    image: golang:1.27.4-bookworm
+    profiles: [tools]
+    working_dir: /src
+    volumes:
+      - '.:/src'
+      - go-cache:/go/pkg/mod
+      - go-build:/root/.cache/go-build
+      - secrets-data:/data/secrets
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      <<: *worker-env
+      DATABASE_URL: postgres://postgres:${CP_DB_PASSWORD}@control-plane-db:5432/controlplane?sslmode=disable
+      TEST_DATABASE_URL: postgres://postgres:${CP_DB_PASSWORD}@control-plane-db:5432/controlplane?sslmode=disable
+      BASE_URL: http://control-plane-1:8080
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      CP_DB_PASSWORD: ${CP_DB_PASSWORD}
+      TENANT_DB_PASSWORD: ${TENANT_DB_PASSWORD}
+      DOCKER_HOST: unix:///var/run/docker.sock
+    depends_on:
+      control-plane-1: {condition: service_healthy}
+
+volumes:
+  cp-data:
+  tenant-data:
+  kafka1-data:
+  kafka2-data:
+  kafkac-data:
+  secrets-data:
+  # Build caches. `task reset` removes them along with the data volumes; the
+  # next build repopulates them from the module proxy.
+  go-cache:
+  go-build:
