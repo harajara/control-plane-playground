@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS inbox (
  applied boolean NOT NULL DEFAULT false, received_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS workers (id text PRIMARY KEY, last_seen timestamptz NOT NULL, current_task text NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS workers_last_seen ON workers(last_seen);
 CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY, email text UNIQUE NOT NULL, password_hash text NOT NULL);
 CREATE TABLE IF NOT EXISTS credentials (
  hash text PRIMARY KEY, user_id uuid NOT NULL REFERENCES users(id),

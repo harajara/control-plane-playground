@@ -131,7 +131,32 @@ unique suffix per run, so scenarios never collide with earlier data, and
 
 Concurrency scenarios use five clients, and "workers are stopped", "workers run
 with fail rate 1" and "the control-plane services restart" are literal: the
-suite drives the real containers through the mounted Docker socket.
+suite drives the real containers through the mounted Docker socket, so the test
+service mounts `/var/run/docker.sock` and reads container logs through the
+Engine API rather than shelling out to the CLI.
+
+To work on one scenario at a time without touching the feature files:
+
+```sh
+docker compose run --rm --no-deps -e BDD_SCENARIO= sweeper test go test -count=1 -tags bdd -v ./tests/bdd/...   # substring of a scenario name
+docker compose run --rm --no-deps -e BDD_PATHS=features/messaging.feature test go test -count=1 -tags bdd ./tests/bdd/...
+```
+
+Both variables only narrow what runs; `task test:bdd` always runs everything.
+`tests/bdd/steps_generated.go` is the registration table godog produced from
+the feature files - edit the features, then `task bdd:stubs`, and implement the
+handlers it reports as pending.
+
+Layout of the suite: `steps_generated.go` is generated and committed;
+`steps_tenants.go`, `steps_contract.go` and `steps_messaging.go` are the
+implementations behind the three kinds of step in the features (lifecycle and
+provisioning, the HTTP contract, broker messaging); `fixtures.go` holds the
+shared "give me a tenant in this state" helpers; and `client.go`, `bus.go`,
+`resources.go`, `containers.go`, `progress.go` and `state.go` are the harness -
+HTTP client, broker access, tenant-server and secret-store reads, container
+control, consumer-progress measurement and per-scenario state. A step never
+reaches into a database it could call an API for, and the harness never
+re-implements a protocol the services speak.
 
 ## Reproducing scenarios by hand
 
@@ -154,7 +179,35 @@ task tenant:psql                # tenant resource server
 Worker flags `--worker-id`, `--fail-rate`, `--min-delay-ms`, `--max-delay-ms`
 override their environment. Six task partitions bound the useful worker count.
 
+## Logs
+
+One structured JSON line per consequential event, and nothing else. A full
+lifecycle, from the request through the worker to the terminal result:
+
+```json
+{"level":"INFO","msg":"control-plane listening","address":":8080","fast_publish":true}
+{"level":"INFO","msg":"tenant created","tenant_id":"5f10f6f0-...","slug":"acme-prod-43d1e8","status":"provisioning","task_id":"47c9609f-...","task_type":"deploy"}
+{"level":"INFO","msg":"task transition","task_id":"47c9609f-...","task_type":"deploy","status":"in_progress"}
+{"level":"INFO","msg":"provisioning finished","worker":"worker-1","task_type":"deploy","status":"done","code":""}
+{"level":"INFO","msg":"task transition","task_id":"47c9609f-...","task_type":"deploy","status":"done","tenant_id":"5f10f6f0-...","tenant_status":"active","version":2,"code":""}
+```
+
+`task logs:check` enforces the standard after a full suite run: every line must
+be a JSON record with `time`, `level` and `msg`; no line may contain a
+configured secret, a connection string or a sealed value; and an idle stack
+must produce essentially nothing (it measures a quiet window, so per-heartbeat
+or per-poll logging fails the gate). `CP_LOG_LEVEL=debug` adds the dedupe and
+retry detail without changing the info-level story.
+
+Worker presence is operational state, not history: `GET /v1/workers` reports
+workers that beat within the last 15 seconds, and a row for a worker that has
+not beaten in an hour is pruned on read. Container names are pinned in
+compose, and a container recreated to change its environment keeps its
+hostname, so a worker's identity survives the change instead of becoming a new
+row.
+
 ## Consistency and availability trade-offs
+
 
 * Kafka has a leader **per partition**, not a cluster master. RF=2 with
   min ISR=2 means both brokers must acknowledge; losing one pauses new

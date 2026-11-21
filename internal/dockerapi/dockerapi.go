@@ -60,39 +60,96 @@ type container struct {
 	Names  []string
 }
 
-// do performs an API request. body may be nil; out may be nil to discard.
+// do performs an API request and fails on any non-2xx answer.
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
+	status, err := c.call(ctx, method, path, body, out)
+	if err != nil {
+		return err
+	}
+	if status/100 != 2 {
+		return fmt.Errorf("docker %s %s: status %d", method, path, status)
+	}
+	return nil
+}
+
+// call performs an API request and reports the status code. Some Docker
+// endpoints answer 304 Not Modified to mean "already in that state" - stop of
+// a stopped container among them - so callers that are asserting a state
+// rather than a change need the code itself.
+func (c *Client) call(ctx context.Context, method, path string, body any, out any) (int, error) {
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		r = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, "http://docker"+c.prefix+path, r)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
-		return err
+		return resp.StatusCode, err
 	}
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("docker %s %s: %d %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
+		return resp.StatusCode, fmt.Errorf("docker %s %s: %d %s", method, path, resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 	if out != nil && len(data) > 0 {
-		return json.Unmarshal(data, out)
+		return resp.StatusCode, json.Unmarshal(data, out)
 	}
-	return nil
+	return resp.StatusCode, nil
+}
+
+// State reports a container's runtime status (created, running, exited, ...).
+func (c *Client) State(ctx context.Context, id string) (string, error) {
+	var s struct {
+		State struct {
+			Status string `json:"Status"`
+		} `json:"State"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/containers/"+id+"/json", nil, &s); err != nil {
+		return "", err
+	}
+	return s.State.Status, nil
+}
+
+// RoleEnv returns the environment of one container carrying the role label,
+// so a caller can check what a running container is actually configured with
+// (for example whether an earlier interrupted run left WORKER_FAIL_RATE=1).
+func (c *Client) RoleEnv(ctx context.Context, role string) (map[string]string, error) {
+	v, err := c.list(ctx, role)
+	if err != nil {
+		return nil, err
+	}
+	if len(v) == 0 {
+		return nil, fmt.Errorf("no containers labelled %s=%s", RoleLabel, role)
+	}
+	var s struct {
+		Config struct {
+			Env []string `json:"Env"`
+		} `json:"Config"`
+	}
+	if err = c.do(ctx, http.MethodGet, "/containers/"+v[0].ID+"/json", nil, &s); err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, item := range s.Config.Env {
+		k, value, ok := strings.Cut(item, "=")
+		if ok {
+			out[k] = value
+		}
+	}
+	return out, nil
 }
 
 // list returns containers carrying the role label, sorted by name so callers
@@ -137,14 +194,31 @@ func (c *Client) Stop(ctx context.Context, role string, timeout time.Duration) e
 		return fmt.Errorf("no containers labelled %s=%s", RoleLabel, role)
 	}
 	for _, item := range v {
-		if err = c.do(ctx, http.MethodPost, "/containers/"+item.ID+"/stop?"+url.Values{"t": {fmt.Sprint(int(timeout.Seconds()))}}.Encode(), nil, nil); err != nil && !notRunning(err) {
-			return err
-		}
-		if err = c.wait(ctx, item.ID, "exited", 3*timeout+5*time.Second); err != nil {
+		if err = c.stopOne(ctx, item.ID, timeout); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// stopOne stops a container and waits for it to report exited. An already
+// stopped container answers 304, which means the wanted state already holds.
+func (c *Client) stopOne(ctx context.Context, id string, timeout time.Duration) error {
+	status, err := c.State(ctx, id)
+	if err != nil {
+		return err
+	}
+	if status == "exited" || status == "dead" {
+		return nil
+	}
+	q := url.Values{"t": {fmt.Sprint(int(timeout.Seconds()))}}
+	if code, err := c.call(ctx, http.MethodPost, "/containers/"+id+"/stop?"+q.Encode(), nil, nil); err != nil {
+		// 304 is success here: the container was already stopped.
+		if code != http.StatusNotModified {
+			return err
+		}
+	}
+	return c.wait(ctx, id, "exited", 3*timeout+5*time.Second)
 }
 
 // Start resumes every container with the role label.
@@ -153,9 +227,16 @@ func (c *Client) Start(ctx context.Context, role string) error {
 	if err != nil {
 		return err
 	}
+	if len(v) == 0 {
+		return fmt.Errorf("no containers labelled %s=%s", RoleLabel, role)
+	}
 	for _, item := range v {
-		if err = c.do(ctx, http.MethodPost, "/containers/"+item.ID+"/start", nil, nil); err != nil && !alreadyStarted(err) {
-			return err
+		if code, err := c.call(ctx, http.MethodPost, "/containers/"+item.ID+"/start", nil, nil); err != nil {
+			// 304 means it was already running, 404 that it vanished between
+			// listing and starting. Neither is a failure to be running.
+			if code != http.StatusNotModified && code != http.StatusNotFound && !alreadyStarted(err) {
+				return err
+			}
 		}
 	}
 	return c.waitRunning(ctx, role)
@@ -167,9 +248,17 @@ func (c *Client) Restart(ctx context.Context, role string, timeout time.Duration
 	if err != nil {
 		return err
 	}
+	if len(v) == 0 {
+		return fmt.Errorf("no containers labelled %s=%s", RoleLabel, role)
+	}
 	for _, item := range v {
-		if err = c.do(ctx, http.MethodPost, "/containers/"+item.ID+"/restart?"+url.Values{"t": {fmt.Sprint(int(timeout.Seconds()))}}.Encode(), nil, nil); err != nil {
-			return err
+		q := url.Values{"t": {fmt.Sprint(int(timeout.Seconds()))}}
+		if err = c.do(ctx, http.MethodPost, "/containers/"+item.ID+"/restart?"+q.Encode(), nil, nil); err != nil {
+			// A stopped container cannot restart; start it instead, which is
+			// what the operator asking for a restart means.
+			if startErr := c.do(ctx, http.MethodPost, "/containers/"+item.ID+"/start", nil, nil); startErr != nil {
+				return err
+			}
 		}
 	}
 	return c.waitRunning(ctx, role)
@@ -200,6 +289,8 @@ func (c *Client) SetEnv(ctx context.Context, role string, env []string) error {
 				Cmd         []string          `json:"Cmd"`
 				Entrypoint  []string          `json:"Entrypoint"`
 				Labels      map[string]string `json:"Labels"`
+				Hostname    string            `json:"Hostname"`
+				Domainname  string            `json:"Domainname"`
 				WorkingDir  string            `json:"WorkingDir"`
 				User        string            `json:"User"`
 				Healthcheck *struct {
@@ -231,10 +322,9 @@ func (c *Client) SetEnv(ctx context.Context, role string, env []string) error {
 			return err
 		}
 		cfg := &inspect.Config
-		if err = c.do(ctx, http.MethodPost, "/containers/"+item.ID+"/stop?"+url.Values{"t": {"10"}}.Encode(), nil, nil); err != nil && !notRunning(err) {
-			return err
-		}
-		if err = c.wait(ctx, item.ID, "exited", 60*time.Second); err != nil {
+		// Stop tolerates a container that is already exited; an interrupted
+		// earlier run may have left it that way.
+		if err = c.stopOne(ctx, item.ID, 10*time.Second); err != nil {
 			return err
 		}
 		if err = c.do(ctx, http.MethodDelete, "/containers/"+item.ID+"?"+url.Values{"force": {"true"}}.Encode(), nil, nil); err != nil {
@@ -246,6 +336,8 @@ func (c *Client) SetEnv(ctx context.Context, role string, env []string) error {
 			"Cmd":          cfg.Cmd,
 			"Entrypoint":   cfg.Entrypoint,
 			"Labels":       cfg.Labels,
+			"Hostname":     cfg.Hostname,
+			"Domainname":   cfg.Domainname,
 			"WorkingDir":   cfg.WorkingDir,
 			"User":         cfg.User,
 			"ExposedPorts": cfg.ExposedPorts,

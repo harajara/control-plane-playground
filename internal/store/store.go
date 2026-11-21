@@ -392,7 +392,22 @@ func (s *Store) Heartbeat(ctx context.Context, w domain.Worker) error {
 	_, err := s.DB.Exec(ctx, `INSERT INTO workers(id,last_seen,current_task) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,current_task=excluded.current_task WHERE workers.last_seen<excluded.last_seen`, w.ID, w.LastSeen.Time, w.CurrentTask)
 	return err
 }
+
+// WorkerRetention is how long a worker's row survives after its last
+// heartbeat. Presence is operational state, not history: a worker that has
+// been gone this long is gone, and keeping its row would let the table grow
+// forever while /v1/workers keeps answering the same question.
+const WorkerRetention = time.Hour
+
 func (s *Store) Workers(ctx context.Context) ([]domain.Worker, error) {
+	// Prune on read. Heartbeats arrive every five seconds and the list is
+	// polled far less often, so this costs a cheap indexed delete at the
+	// moment somebody actually looks, and needs no background job.
+	// make_interval keeps the parameter type explicit: an interval must not
+	// be inferred from a Go duration.
+	if _, err := s.DB.Exec(ctx, "DELETE FROM workers WHERE last_seen < now()-make_interval(secs=>$1)", int64(WorkerRetention.Seconds())); err != nil {
+		return nil, err
+	}
 	v := []domain.Worker{}
 	rows, err := s.DB.Query(ctx, "SELECT id,last_seen,current_task,last_seen>now()-interval '15 seconds' FROM workers ORDER BY id")
 	if err != nil {

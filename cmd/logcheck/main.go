@@ -32,18 +32,20 @@ func forbidden() []string {
 func main() {
 	tail := flag.Int("tail", 200, "log lines to inspect per container")
 	maxLines := flag.Int("max-lines", 800, "maximum lines allowed across the tail window")
-	window := flag.Duration("recent-window", time.Minute, "idle window used to measure the log rate")
+	settle := flag.Duration("settle", 25*time.Second, "quiet time to wait before measuring the idle rate")
+	window := flag.Duration("recent-window", 15*time.Second, "idle window used to measure the log rate")
 	maxRecent := flag.Int("max-recent-lines", 8, "maximum lines an idle stack may produce within the window")
 	flag.Parse()
-	if err := run(*tail, *maxLines, *window, *maxRecent); err != nil {
+	if err := run(*tail, *maxLines, *settle, *window, *maxRecent); err != nil {
 		fmt.Fprintln(os.Stderr, "log check failed:", err)
 		os.Exit(1)
 	}
 	fmt.Println("logs: meaningful, sanitized, and quiet while idle")
 }
 
-func run(tail, maxLines int, window time.Duration, maxRecent int) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+func run(tail, maxLines int, settle, window time.Duration, maxRecent int) error {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), settle+window+2*time.Minute)
 	defer cancel()
 	client, err := dockerapi.New()
 	if err != nil {
@@ -64,15 +66,36 @@ func run(tail, maxLines int, window time.Duration, maxRecent int) error {
 			return err
 		}
 	}
+	// The rate check needs a genuinely idle stack. Right after a test suite
+	// the last scenario's task transitions are still inside any recent window,
+	// so wait for the work to finish, then measure a fresh window only. The
+	// settle period must outlast the window or the measurement includes the
+	// activity it is meant to exclude.
+	if settle <= window {
+		return fmt.Errorf("settle %v must be longer than the measurement window %v", settle, window)
+	}
+	time.Sleep(time.Until(start.Add(settle)))
 	recent, err := collect(ctx, client, 0, window)
 	if err != nil {
 		return err
 	}
 	if len(recent) > maxRecent {
-		return fmt.Errorf("%d log lines in %v while idle, limit %d: something logs on a timer", len(recent), window, maxRecent)
+		return fmt.Errorf("%d log lines in %v while idle, limit %d: something logs on a timer%s", len(recent), window, maxRecent, sample(recent))
 	}
-	fmt.Printf("checked %d historical and %d recent lines\n", len(lines), len(recent))
+	fmt.Printf("checked %d historical lines and %d lines over a %v idle window\n", len(lines), len(recent), window)
 	return nil
+}
+
+// sample shows the first two offenders, which is enough to find the culprit.
+func sample(v []string) string {
+	if len(v) == 0 {
+		return ""
+	}
+	limit := 2
+	if len(v) < limit {
+		limit = len(v)
+	}
+	return ": " + strings.Join(v[:limit], " | ")
 }
 
 // collect reads application lines for both roles, optionally restricted to a

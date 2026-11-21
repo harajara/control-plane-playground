@@ -186,6 +186,40 @@ func TestOutboxCommitRetryAndRollback(t *testing.T) {
 		t.Fatalf("concurrent relays=%d", calls.Load())
 	}
 }
+func TestWorkersArePrunedAfterRetention(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"worker-1", "worker-2", "retired-worker"} {
+		if err := s.Heartbeat(ctx, domain.Worker{ID: id, LastSeen: domain.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Age one worker past the retention window, exactly as the clock would.
+	if _, err := s.DB.Exec(ctx, "UPDATE workers SET last_seen=now()-make_interval(secs=>$2) WHERE id=$1", "retired-worker", int64((WorkerRetention + time.Minute).Seconds())); err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.Workers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 2 {
+		t.Fatalf("workers=%d, want the two live ones: %+v", len(v), v)
+	}
+	for _, w := range v {
+		if w.ID == "retired-worker" {
+			t.Fatal("a retired worker is still listed")
+		}
+		if !w.Online {
+			t.Fatalf("fresh worker %s reported offline", w.ID)
+		}
+	}
+	// Reading again must not drop anything that is still beating.
+	again, err := s.Workers(ctx)
+	if err != nil || len(again) != 2 {
+		t.Fatalf("second read: %d workers, %v", len(again), err)
+	}
+}
+
 func TestDestroyTombstoneAndGuards(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
