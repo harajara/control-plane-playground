@@ -19,6 +19,21 @@ Prerequisites: Docker with Compose v2 and [Task](https://taskfile.dev). Builds
 and tests run inside pinned containers, so the host needs no Go toolchain or
 C compiler. Allow roughly 4–6 GB for Docker.
 
+`task setup` writes `.env` once and never rewrites a value that is already
+there, because the Postgres volumes are initialised with those passwords and
+already-sealed task commands refer to those keys. So `.env` and the volumes
+belong together: reset them as one thing, or neither.
+
+```sh
+task down      # stop, keep every volume
+task reset     # destructive: delete all volumes, delete .env, boot again
+```
+
+`task reset` is the answer to "I changed a password by hand and now the
+database will not start". Starting fresh from an existing `.env` also works -
+the volumes are re-initialised from the same values - which is the property
+that makes the Gherkin suite re-runnable.
+
 ## What it does
 
 A tenant mutation is durable before it is acknowledged, and a worker then does
